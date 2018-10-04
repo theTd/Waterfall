@@ -1,0 +1,382 @@
+From f99415b11b8d830b6bd76ba1f589d518c5771203 Mon Sep 17 00:00:00 2001
+From: theTd <i@thetd.me>
+Date: Thu, 4 Oct 2018 14:47:45 +0800
+Subject: [PATCH] listeners support auth proxy, use netease auth server
+
+
+diff --git a/api/src/main/java/net/md_5/bungee/api/config/ListenerInfo.java b/api/src/main/java/net/md_5/bungee/api/config/ListenerInfo.java
+index 42b84063..bdab54a6 100644
+--- a/api/src/main/java/net/md_5/bungee/api/config/ListenerInfo.java
++++ b/api/src/main/java/net/md_5/bungee/api/config/ListenerInfo.java
+@@ -1,6 +1,7 @@
+ package net.md_5.bungee.api.config;
+ 
+ import java.net.InetSocketAddress;
++import java.net.URL;
+ import java.util.List;
+ import java.util.Map;
+ import lombok.AllArgsConstructor;
+@@ -72,10 +73,12 @@ public class ListenerInfo
+      */
+     private final boolean proxyProtocol;
+ 
++    private final URL authProxyUrl;
++
+     @Deprecated
+     public ListenerInfo(InetSocketAddress host, String motd, int maxPlayers, int tabListSize, List<String> serverPriority, boolean forceDefault, Map<String, String> forcedHosts, String tabListType, boolean setLocalAddress, boolean pingPassthrough, int queryPort, boolean queryEnabled)
+     {
+-        this( host, motd, maxPlayers, tabListSize, serverPriority, forceDefault, forcedHosts, tabListType, setLocalAddress, pingPassthrough, queryPort, queryEnabled, false );
++        this( host, motd, maxPlayers, tabListSize, serverPriority, forceDefault, forcedHosts, tabListType, setLocalAddress, pingPassthrough, queryPort, queryEnabled, false , null);
+     }
+ 
+     /**
+diff --git a/proxy/pom.xml b/proxy/pom.xml
+index df84d6f1..514d7167 100644
+--- a/proxy/pom.xml
++++ b/proxy/pom.xml
+@@ -49,6 +49,12 @@
+             <scope>compile</scope>
+         </dependency>
+         <!-- Waterfall End -->
++        <dependency>
++            <groupId>io.netty</groupId>
++            <artifactId>netty-handler-proxy</artifactId>
++            <version>${netty.version}</version>
++            <scope>compile</scope>
++        </dependency>
+         <dependency>
+             <groupId>io.netty</groupId>
+             <artifactId>netty-handler</artifactId>
+diff --git a/proxy/src/main/java/net/md_5/bungee/conf/YamlConfig.java b/proxy/src/main/java/net/md_5/bungee/conf/YamlConfig.java
+index 1019c307..579523d8 100644
+--- a/proxy/src/main/java/net/md_5/bungee/conf/YamlConfig.java
++++ b/proxy/src/main/java/net/md_5/bungee/conf/YamlConfig.java
+@@ -1,22 +1,6 @@
+ package net.md_5.bungee.conf;
+ 
+ import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+-import java.io.File;
+-import java.io.FileInputStream;
+-import java.io.FileWriter;
+-import java.io.IOException;
+-import java.io.InputStream;
+-import java.net.InetSocketAddress;
+-import java.util.ArrayList;
+-import java.util.Arrays;
+-import java.util.Collection;
+-import java.util.Collections;
+-import java.util.HashMap;
+-import java.util.HashSet;
+-import java.util.LinkedHashMap;
+-import java.util.List;
+-import java.util.Map;
+-import java.util.logging.Level;
+ import lombok.RequiredArgsConstructor;
+ import net.md_5.bungee.Util;
+ import net.md_5.bungee.api.ChatColor;
+@@ -29,6 +13,13 @@ import org.yaml.snakeyaml.DumperOptions;
+ import org.yaml.snakeyaml.Yaml;
+ import org.yaml.snakeyaml.error.YAMLException;
+ 
++import java.io.*;
++import java.net.InetSocketAddress;
++import java.net.MalformedURLException;
++import java.net.URL;
++import java.util.*;
++import java.util.logging.Level;
++
+ public class YamlConfig implements ConfigurationAdapter
+ {
+ 
+@@ -290,7 +281,17 @@ public class YamlConfig implements ConfigurationAdapter
+             }
+             set( "priorities", serverPriority, val );
+ 
+-            ListenerInfo info = new ListenerInfo( address, motd, maxPlayers, tabListSize, serverPriority, forceDefault, forced, value.toString(), setLocalAddress, pingPassthrough, queryPort, query, proxyProtocol );
++            String authProxy = get("auth_proxy", null, val);
++            URL authProxyUrl = null;
++            if (authProxy != null) {
++                try {
++                    authProxyUrl = new URL(authProxy);
++                } catch (MalformedURLException e) {
++                    throw new IllegalArgumentException("bad auth proxy url: " + authProxy);
++                }
++            }
++
++            ListenerInfo info = new ListenerInfo( address, motd, maxPlayers, tabListSize, serverPriority, forceDefault, forced, value.toString(), setLocalAddress, pingPassthrough, queryPort, query, proxyProtocol, authProxyUrl);
+             ret.add( info );
+         }
+ 
+diff --git a/proxy/src/main/java/net/md_5/bungee/connection/HasJoinedRequest.java b/proxy/src/main/java/net/md_5/bungee/connection/HasJoinedRequest.java
+new file mode 100644
+index 00000000..b6613c93
+--- /dev/null
++++ b/proxy/src/main/java/net/md_5/bungee/connection/HasJoinedRequest.java
+@@ -0,0 +1,14 @@
++package net.md_5.bungee.connection;
++
++import lombok.AllArgsConstructor;
++import lombok.Data;
++
++@Data
++@AllArgsConstructor
++public class HasJoinedRequest
++{
++    public static final String URL = "http://x19authserver.nie.netease.com/check";
++    //public static final String URL = "http://x19authexpr.nie.netease.com/check";
++    public String username;
++    public String serverId;
++}
+diff --git a/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java b/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java
+index 8f63e997..5336c45d 100644
+--- a/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java
++++ b/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java
+@@ -415,20 +415,19 @@ public class InitialHandler extends PacketHandler implements PendingConnection
+         BungeeCipher encrypt = EncryptionUtil.getCipher( true, sharedKey );
+         ch.addBefore( PipelineUtils.FRAME_PREPENDER, PipelineUtils.ENCRYPT_HANDLER, new CipherEncoder( encrypt ) );
+ 
+-        String encName = URLEncoder.encode( InitialHandler.this.getName(), "UTF-8" );
++        String username = InitialHandler.this.getName();
+ 
+         MessageDigest sha = MessageDigest.getInstance( "SHA-1" );
+         for ( byte[] bit : new byte[][]
+         {
+-            request.getServerId().getBytes( "ISO_8859_1" ), sharedKey.getEncoded(), EncryptionUtil.keys.getPublic().getEncoded()
++                request.getServerId().getBytes( "ISO_8859_1" ), sharedKey.getEncoded(), EncryptionUtil.keys.getPublic().getEncoded()
+         } )
+         {
+             sha.update( bit );
+         }
+-        String encodedHash = URLEncoder.encode( new BigInteger( sha.digest() ).toString( 16 ), "UTF-8" );
+-
+-        String preventProxy = ( ( BungeeCord.getInstance().config.isPreventProxyConnections() ) ? "&ip=" + URLEncoder.encode( getAddress().getAddress().getHostAddress(), "UTF-8" ) : "" );
+-        String authURL = "https://sessionserver.mojang.com/session/minecraft/hasJoined?username=" + encName + "&serverId=" + encodedHash + preventProxy;
++        String serverID = new BigInteger( sha.digest() ).toString( 16 );
++ 
++        final HasJoinedRequest data = new HasJoinedRequest(username, serverID);
+ 
+         Callback<String> handler = new Callback<String>()
+         {
+@@ -455,7 +454,7 @@ public class InitialHandler extends PacketHandler implements PendingConnection
+             }
+         };
+ 
+-        HttpClient.get( authURL, ch.getHandle().eventLoop(), handler );
++        HttpClient.post( HasJoinedRequest.URL, data, ch.getHandle().eventLoop(), handler, listener.getAuthProxyUrl() );
+     }
+ 
+     private void finish()
+diff --git a/proxy/src/main/java/net/md_5/bungee/http/HttpClient.java b/proxy/src/main/java/net/md_5/bungee/http/HttpClient.java
+index b265bb43..2d1ad39a 100644
+--- a/proxy/src/main/java/net/md_5/bungee/http/HttpClient.java
++++ b/proxy/src/main/java/net/md_5/bungee/http/HttpClient.java
+@@ -8,17 +8,16 @@ import io.netty.channel.ChannelFuture;
+ import io.netty.channel.ChannelFutureListener;
+ import io.netty.channel.ChannelOption;
+ import io.netty.channel.EventLoop;
+-import io.netty.handler.codec.http.DefaultHttpRequest;
+-import io.netty.handler.codec.http.HttpHeaders;
+-import io.netty.handler.codec.http.HttpMethod;
+-import io.netty.handler.codec.http.HttpRequest;
+-import io.netty.handler.codec.http.HttpVersion;
++import io.netty.handler.codec.http.*;
++
+ import java.net.InetAddress;
+ import java.net.URI;
++import java.net.URL;
+ import java.net.UnknownHostException;
+ import java.util.concurrent.TimeUnit;
+ import lombok.AccessLevel;
+ import lombok.NoArgsConstructor;
++import net.md_5.bungee.BungeeCord;
+ import net.md_5.bungee.api.Callback;
+ import net.md_5.bungee.netty.PipelineUtils;
+ 
+@@ -35,6 +34,29 @@ public class HttpClient
+ 
+     @SuppressWarnings("UnusedAssignment")
+     public static void get(String url, EventLoop eventLoop, final Callback<String> callback)
++    {
++        httpRequest(url, null, eventLoop, callback, null);
++    }
++
++    @SuppressWarnings("UnusedAssignment")
++    public static void get(String url, EventLoop eventLoop, final Callback<String> callback, URL authProxyUrl)
++    {
++        httpRequest(url, null, eventLoop, callback, authProxyUrl);
++    }
++
++    @SuppressWarnings("UnusedAssignment")
++    public static void post(String url, final Object data, EventLoop eventLoop, final Callback<String> callback)
++    {
++        httpRequest(url, data, eventLoop, callback, null);
++    }
++
++    @SuppressWarnings("UnusedAssignment")
++    public static void post(String url, final Object data, EventLoop eventLoop, final Callback<String> callback, URL authProxyUrl)
++    {
++        httpRequest(url, data, eventLoop, callback, authProxyUrl);
++    }
++
++    private static void httpRequest(String url, final Object data, EventLoop eventLoop, final Callback<String> callback, URL authProxyUrl)
+     {
+         Preconditions.checkNotNull( url, "url" );
+         Preconditions.checkNotNull( eventLoop, "eventLoop" );
+@@ -86,7 +108,19 @@ public class HttpClient
+                 {
+                     String path = uri.getRawPath() + ( ( uri.getRawQuery() == null ) ? "" : "?" + uri.getRawQuery() );
+ 
+-                    HttpRequest request = new DefaultHttpRequest( HttpVersion.HTTP_1_1, HttpMethod.GET, path );
++                    HttpRequest request;
++                    if (data == null) {
++                        request = new DefaultHttpRequest (HttpVersion.HTTP_1_1, HttpMethod.GET, path  );
++                    } else {
++                        DefaultFullHttpRequest fullRequest = new DefaultFullHttpRequest (HttpVersion.HTTP_1_1, HttpMethod.POST, path  );
++                        fullRequest.headers().set( HttpHeaders.Names.CONTENT_TYPE, "application/json");
++                        String content = BungeeCord.getInstance().gson.toJson(data);
++                        byte[] raw = content.getBytes("UTF-8");
++                        fullRequest.headers().set( HttpHeaders.Names.CONTENT_LENGTH, raw.length);
++                        fullRequest.content().clear().writeBytes(raw);
++
++                        request = fullRequest;
++                    }
+                     request.headers().set( HttpHeaders.Names.HOST, uri.getHost() );
+ 
+                     future.channel().writeAndFlush( request );
+@@ -100,21 +134,21 @@ public class HttpClient
+ 
+         // Waterfall Start - Optionally use Netty's async DNS Resolver
+         if (net.md_5.bungee.api.ProxyServer.getInstance().getConfig().isUseNettyDnsResolver()) {
+-            getWithNettyResolver(eventLoop, uri, port, future, callback, ssl);
++            getWithNettyResolver(eventLoop, uri, port, future, callback, ssl, authProxyUrl);
+         } else {
+-            getWithDefaultResolver(eventLoop, uri, port, future, callback, ssl);
++            getWithDefaultResolver(eventLoop, uri, port, future, callback, ssl, authProxyUrl);
+         }
+         //new Bootstrap().channel( PipelineUtils.getChannel() ).group( eventLoop ).handler( new HttpInitializer( callback, ssl, uri.getHost(), port ) ).
+         //        option( ChannelOption.CONNECT_TIMEOUT_MILLIS, TIMEOUT ).remoteAddress( inetHost, port ).connect().addListener( future );
+     }
+ 
+-    private static void getWithNettyResolver(EventLoop eventLoop, URI uri, int port, ChannelFutureListener future, Callback<String> callback, boolean ssl) {
++    private static void getWithNettyResolver(EventLoop eventLoop, URI uri, int port, ChannelFutureListener future, Callback<String> callback, boolean ssl, URL authProxyUrl) {
+         java.net.InetSocketAddress address = java.net.InetSocketAddress.createUnresolved(uri.getHost(), port);
+-        new Bootstrap().channel( PipelineUtils.getChannel() ).group( eventLoop ).handler( new HttpInitializer( callback, ssl, uri.getHost(), port ) ).
++        new Bootstrap().channel( PipelineUtils.getChannel() ).group( eventLoop ).handler( new HttpInitializer( callback, ssl, uri.getHost(), port, authProxyUrl ) ).
+                 option( ChannelOption.CONNECT_TIMEOUT_MILLIS, TIMEOUT ).resolver(dnsResolverGroup).remoteAddress( address ).connect().addListener( future );
+     }
+ 
+-    private static void getWithDefaultResolver(EventLoop eventLoop, URI uri, int port, ChannelFutureListener future, Callback<String> callback, boolean ssl) {
++    private static void getWithDefaultResolver(EventLoop eventLoop, URI uri, int port, ChannelFutureListener future, Callback<String> callback, boolean ssl, URL authProxyUrl) {
+         // This is identical to the Bungee implementation of #get other than the absence of the ChannelFutureListener creation
+         InetAddress inetHost = addressCache.getIfPresent( uri.getHost() );
+         if ( inetHost == null )
+@@ -129,7 +163,7 @@ public class HttpClient
+             }
+             addressCache.put( uri.getHost(), inetHost );
+         }
+-        new Bootstrap().channel( PipelineUtils.getChannel() ).group( eventLoop ).handler( new HttpInitializer( callback, ssl, uri.getHost(), port ) ).
++        new Bootstrap().channel( PipelineUtils.getChannel() ).group( eventLoop ).handler( new HttpInitializer( callback, ssl, uri.getHost(), port, authProxyUrl ) ).
+                 option( ChannelOption.CONNECT_TIMEOUT_MILLIS, TIMEOUT ).remoteAddress( inetHost, port ).connect().addListener( future );
+     }
+     // Waterfall End
+diff --git a/proxy/src/main/java/net/md_5/bungee/http/HttpInitializer.java b/proxy/src/main/java/net/md_5/bungee/http/HttpInitializer.java
+index ea75dfcd..70d81bba 100644
+--- a/proxy/src/main/java/net/md_5/bungee/http/HttpInitializer.java
++++ b/proxy/src/main/java/net/md_5/bungee/http/HttpInitializer.java
+@@ -3,9 +3,16 @@ package net.md_5.bungee.http;
+ import io.netty.channel.Channel;
+ import io.netty.channel.ChannelInitializer;
+ import io.netty.handler.codec.http.HttpClientCodec;
++import io.netty.handler.proxy.HttpProxyHandler;
++import io.netty.handler.proxy.ProxyHandler;
++import io.netty.handler.proxy.Socks5ProxyHandler;
+ import io.netty.handler.ssl.SslContext;
+ import io.netty.handler.ssl.SslHandler;
+ import io.netty.handler.timeout.ReadTimeoutHandler;
++
++import java.net.InetSocketAddress;
++import java.net.Proxy;
++import java.net.URL;
+ import java.util.concurrent.TimeUnit;
+ import javax.net.ssl.SSLEngine;
+ import lombok.RequiredArgsConstructor;
+@@ -19,6 +26,7 @@ public class HttpInitializer extends ChannelInitializer<Channel>
+     private final boolean ssl;
+     private final String host;
+     private final int port;
++    private final URL proxyUrl;
+ 
+     @Override
+     protected void initChannel(Channel ch) throws Exception
+@@ -32,5 +40,68 @@ public class HttpInitializer extends ChannelInitializer<Channel>
+         }
+         ch.pipeline().addLast( "http", new HttpClientCodec() );
+         ch.pipeline().addLast( "handler", new HttpHandler( callback ) );
++
++        initProxyHandler(ch);
++    }
++
++    private void initProxyHandler(Channel ch) {
++        if (proxyUrl == null) return;
++        Proxy.Type proxyType = null;
++        switch (proxyUrl.getProtocol()) {
++            case "http":
++            case "https":
++                proxyType = Proxy.Type.HTTP;
++                break;
++            case "socks":
++            case "socks5":
++                proxyType = Proxy.Type.SOCKS;
++                break;
++        }
++
++        if (proxyType != null) {
++            int port = proxyUrl.getPort();
++            if (port == -1) port = proxyUrl.getDefaultPort();
++
++            ProxyHandler proxyHandler = null;
++            String username;
++            String password = "";
++
++            String userInfo = proxyUrl.getUserInfo();
++            if (userInfo != null) {
++                int colon = userInfo.indexOf(":");
++                if (colon == -1) {
++                    username = userInfo;
++                } else {
++                    username = userInfo.substring(0, colon);
++                    password = userInfo.substring(colon + 1);
++                }
++
++                switch (proxyType) {
++                    case HTTP:
++                        proxyHandler = new HttpProxyHandler(
++                                new InetSocketAddress(proxyUrl.getHost(), port),
++                                username, password);
++                        break;
++                    case SOCKS:
++                        proxyHandler = new Socks5ProxyHandler(
++                                new InetSocketAddress(proxyUrl.getHost(), port),
++                                username, password);
++                        break;
++                }
++            } else {
++                switch (proxyType) {
++                    case HTTP:
++                        proxyHandler = new HttpProxyHandler(
++                                new InetSocketAddress(proxyUrl.getHost(), port));
++                        break;
++                    case SOCKS:
++                        proxyHandler = new Socks5ProxyHandler(
++                                new InetSocketAddress(proxyUrl.getHost(), port));
++                        break;
++                }
++            }
++
++            ch.pipeline().addFirst("proxy", proxyHandler);
++        }
+     }
+ }
+-- 
+2.15.2 (Apple Git-101.1)
+
